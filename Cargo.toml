@@ -1,0 +1,11 @@
+[package]
+name = "mindarust"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-клиент для обычных серверов Mindustry 160.8: окно, мир, чат, FPS"
+
+[dependencies]
+# Окно, ввод, спрайты и текст.
+macroquad = "0.4.16"
+# Распаковка zlib-потока мира, который присылает сервер.
+flate2 = "1"

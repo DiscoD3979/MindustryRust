@@ -1,0 +1,7 @@
+﻿/target/
+/identity.bin
+/gui-*.txt
+/remote-*.txt
+/screen-*.png
+/world-*.bin
+/world-error.txt
