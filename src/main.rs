@@ -314,6 +314,62 @@ fn draw_unit(
     );
 }
 
+// Вариант текстуры пола: точная реализация Arc Mathf.randomSeed + Rand.
+struct ArcRand {
+    seed0: u64,
+    seed1: u64,
+}
+
+impl ArcRand {
+    fn new(seed: i64) -> Self {
+        let s = if seed == 0 { i64::MIN } else { seed };
+        let seed0 = murmur3(s as u64);
+        Self { seed0, seed1: murmur3(seed0) }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let s1 = self.seed0;
+        let s0 = self.seed1;
+        self.seed0 = s0;
+        let s1 = s1 ^ (s1 << 23);
+        let out = (s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26)).wrapping_add(s0);
+        self.seed1 = out;
+        out
+    }
+
+    fn next_bounded(&mut self, n: u64) -> u64 {
+        loop {
+            let bits = self.next_u64() >> 1;
+            let value = bits % n;
+            let ok = (bits as i64)
+                .wrapping_sub(value as i64)
+                .wrapping_add((n - 1) as i64)
+                >= 0;
+            if ok { return value; }
+        }
+    }
+}
+
+fn murmur3(mut x: u64) -> u64 {
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
+}
+
+fn floor_variant(x: i32, y: i32, variants: i32) -> i32 {
+    if variants <= 1 { return 0; }
+    let pack = (((x as i16) as i32) << 16) | (((y as i16) as u16) as i32);
+    let max = variants - 1;
+    let mut r = ArcRand::new(pack as i64);
+    if max != 0 && (max & (max - 1)) == 0 {
+        let _ = r.next_u64();
+    }
+    r.next_bounded(variants as u64) as i32
+}
+
 fn draw_world(
     world: &World,
     atlas: Option<&Atlas>,
@@ -353,7 +409,7 @@ fn draw_world(
             let mut drawn = false;
             if let Some(a) = atlas {
                 let idx = y as usize * world.width + x as usize;
-                let variant = 1 + (world.floor_data[idx] % 6) as i32;
+                let variant = 1 + floor_variant(x, y, 6);
                 let name = format!("{}{}", floor_name, variant);
                 drawn = draw_sprite(a, pages, &name, sx, sy, tile, WHITE)
                     || draw_sprite(a, pages, floor_name, sx, sy, tile, WHITE);
@@ -683,15 +739,20 @@ async fn main() {
                     draw_world(w, atlas.as_ref(), &pages, palette.as_ref(), cam_x, cam_y, zoom);
                     let tile = 16.0 * zoom;
                     for p in &players {
-                        let sx = (p.x - cam_x) * tile + screen_width() / 2.0;
-                        let sy = (cam_y - p.y) * tile + screen_height() / 2.0;
+                        // Позиции сущностей заданы в пикселях мира: 1 тайл = 8 единиц.
+                        let px = p.x / 8.0;
+                        let py = p.y / 8.0;
+                        let sx = (px - cam_x) * tile + screen_width() / 2.0;
+                        let sy = (cam_y - py) * tile + screen_height() / 2.0;
                         if sx > -40.0 && sy > -40.0 && sx < screen_width() + 40.0 && sy < screen_height() + 40.0 {
                             draw_player(p, sx, sy, tile, font.as_ref());
                         }
                     }
                     for u in &units {
-                        let sx = (u.x - cam_x) * tile + screen_width() / 2.0;
-                        let sy = (cam_y - u.y) * tile + screen_height() / 2.0;
+                        let ux = u.x / 8.0;
+                        let uy = u.y / 8.0;
+                        let sx = (ux - cam_x) * tile + screen_width() / 2.0;
+                        let sy = (cam_y - uy) * tile + screen_height() / 2.0;
                         if sx > -40.0 && sy > -40.0 && sx < screen_width() + 40.0 && sy < screen_height() + 40.0 {
                             let name = usize::try_from(u.unit_type)
                                 .ok()
@@ -823,5 +884,21 @@ async fn main() {
 
         last_mouse = (mx, my);
         next_frame().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::floor_variant;
+
+    #[test]
+    fn floor_variant_matches_arc_rand() {
+        assert_eq!(floor_variant(0, 0, 6), 4);
+        assert_eq!(floor_variant(1, 1, 6), 1);
+        assert_eq!(floor_variant(10, 20, 6), 1);
+        assert_eq!(floor_variant(200, 200, 6), 2);
+        assert_eq!(floor_variant(202, 200, 6), 0);
+        assert_eq!(floor_variant(-3, 50, 6), 3);
+        assert_eq!(floor_variant(0, 0, 5), 0);
     }
 }
