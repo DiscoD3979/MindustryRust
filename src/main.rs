@@ -768,9 +768,12 @@ async fn main() {
     let mut last_status = String::new();
     let mut chat_log: Vec<String> = Vec::new();
     let mut chat_input = String::new();
+    let mut chat_open = false;
 
     let mut cam_x = 0.0f32;
     let mut cam_y = 0.0f32;
+    let mut cam_off_x = 0.0f32;
+    let mut cam_off_y = 0.0f32;
     let mut zoom = 1.0f32;
     let mut last_mouse = mouse_position();
     let mut fps_instant = Instant::now();
@@ -826,6 +829,10 @@ async fn main() {
                         own_unit_id = -1;
                         own_x = w.width as f32 * 4.0;
                         own_y = w.height as f32 * 4.0;
+                        cam_off_x = 0.0;
+                        cam_off_y = 0.0;
+                        chat_open = false;
+                        chat_input.clear();
                         world = Some(w);
                         players.clear();
                         units.clear();
@@ -903,12 +910,12 @@ async fn main() {
                             .and_then(|id| update.iter().find(|p| p.id == id))
                             .and_then(|p| new_units.iter().find(|u| u.id == p.unit_id));
                         if let Some(u) = my_unit {
-                            own_unit_id = u.id;
-                            // Первый снимок задаёт позицию; дальше её ведём сами.
-                            if own_x == 0.0 && own_y == 0.0 {
+                            // Первый снимок (или новый юнит после смерти) задаёт позицию.
+                            if u.id != own_unit_id || (own_x == 0.0 && own_y == 0.0) {
                                 own_x = u.x;
                                 own_y = u.y;
                             }
+                            own_unit_id = u.id;
                         } else if own_unit_id < 0 {
                             if let Some(p) = my_player_id
                                 .and_then(|id| update.iter().find(|pid| pid.id == id))
@@ -1091,51 +1098,85 @@ async fn main() {
                     || is_key_pressed(KeyCode::Escape)
                 {
                     disconnect(&mut events, &mut chat_tx, &mut cancel, &mut world, &mut chat_log);
+                    chat_open = false;
+                    chat_input.clear();
                     net_state = NetState::Menu;
                 }
             }
 
             NetState::Playing => {
+                // Чат модальный: Enter открывает и отправляет, Esc закрывает.
+                if is_key_pressed(KeyCode::Enter) {
+                    if chat_open {
+                        if !chat_input.trim().is_empty() {
+                            if let Some(tx) = &chat_tx {
+                                let _ = tx.send(chat_input.trim().to_string());
+                            }
+                        }
+                        chat_input.clear();
+                        chat_open = false;
+                    } else {
+                        chat_input.clear();
+                        chat_open = true;
+                    }
+                }
+                if is_key_pressed(KeyCode::Escape) && chat_open {
+                    chat_input.clear();
+                    chat_open = false;
+                }
+
                 if let Some(w) = &world {
                     let wheel = mouse_wheel().1;
-                    if wheel != 0.0 {
+                    if wheel != 0.0 && !chat_open {
                         zoom = (zoom + wheel * 0.1).clamp(0.4, 3.0);
                     }
                     if is_mouse_button_down(MouseButton::Right)
+                        && !chat_open
                         && my > 40.0
                         && my < screen_height() - 70.0
                     {
-                        cam_x -= (mx - last_mouse.0) / (16.0 * zoom);
-                        cam_y += (my - last_mouse.1) / (16.0 * zoom);
+                        cam_off_x -= (mx - last_mouse.0) / (16.0 * zoom);
+                        cam_off_y += (my - last_mouse.1) / (16.0 * zoom);
+                    }
+                    if own_unit_id >= 0 {
+                        cam_x = own_x / 8.0 + cam_off_x;
+                        cam_y = own_y / 8.0 + cam_off_y;
                     }
                     let tile = 16.0 * zoom;
 
-                    // Управление своим юнитом: WASD/стрелки задают направление,
-                    // ЛКМ стреляет, ПКМ двигает камеру, Shift ускоряет.
+                    // WASD/стрелки двигают юнита, ПКМ задаёт смещение камеры,
+                    // камера следует за юнитом, Shift ускоряет.
                     let mut dir_x = 0.0f32;
                     let mut dir_y = 0.0f32;
-                    if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { dir_x -= 1.0; }
-                    if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { dir_x += 1.0; }
-                    if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) { dir_y += 1.0; }
-                    if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) { dir_y -= 1.0; }
+                    if !chat_open {
+                        if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { dir_x -= 1.0; }
+                        if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { dir_x += 1.0; }
+                        if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) { dir_y += 1.0; }
+                        if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) { dir_y -= 1.0; }
+                    }
                     let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
                     if len > 0.0 {
                         dir_x /= len;
                         dir_y /= len;
                     }
                     let speed = 18.0f32;
-                    let step = speed * get_frame_time();
+                    let mut step = speed * get_frame_time();
+                    if chat_open {
+                        step = 0.0;
+                    }
                     own_x += dir_x * step;
                     own_y += dir_y * step;
 
                     let mouse_world_x = (cam_x + (mx - screen_width() / 2.0) / tile) * 8.0;
                     let mouse_world_y = (cam_y - (my - screen_height() / 2.0) / tile) * 8.0;
                     let rotation = (mouse_world_y - own_y).atan2(mouse_world_x - own_x);
-                    let shooting = is_mouse_button_down(MouseButton::Left)
+                    let shooting = !chat_open
+                        && is_mouse_button_down(MouseButton::Left)
                         && my > 40.0
                         && my < screen_height() - 70.0
                         && !chat_rect.contains(vec2(mx, my));
-                    let boosting = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+                    let boosting = !chat_open
+                        && (is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift));
 
                     {
                         let mut input = client_input.lock().unwrap();
@@ -1215,9 +1256,11 @@ async fn main() {
                     Rect::new(screen_width() - 160.0, 4.0, 148.0, 28.0),
                     "Выйти с сервера",
                     font.as_ref(),
-                ) || is_key_pressed(KeyCode::Escape)
+                ) || (is_key_pressed(KeyCode::Escape) && !chat_open)
                 {
                     disconnect(&mut events, &mut chat_tx, &mut cancel, &mut world, &mut chat_log);
+                    chat_open = false;
+                    chat_input.clear();
                     net_state = NetState::Menu;
                 }
 
@@ -1235,35 +1278,43 @@ async fn main() {
                     draw_chat_text(line, 20.0, y + 17.0, font.as_ref(), 18);
                 }
 
-                draw_rectangle(chat_rect.x, chat_rect.y, chat_rect.w, chat_rect.h,
-                    Color::new(0.05, 0.06, 0.08, 0.85));
-                if let Some(ch) = get_char_pressed() {
-                    if !ch.is_control() && chat_input.len() < 120 {
-                        chat_input.push(ch);
+                if chat_open {
+                    draw_rectangle(chat_rect.x, chat_rect.y, chat_rect.w, chat_rect.h,
+                        Color::new(0.05, 0.06, 0.08, 0.85));
+                    if let Some(ch) = get_char_pressed() {
+                        if !ch.is_control() && chat_input.len() < 120 {
+                            chat_input.push(ch);
+                        }
                     }
-                }
-                if backspace_pressed(&mut bs_latch) {
-                    chat_input.pop();
-                }
-                if is_key_pressed(KeyCode::Enter) && !chat_input.trim().is_empty() {
-                    if let Some(tx) = &chat_tx {
-                        let _ = tx.send(chat_input.trim().to_string());
+                    if backspace_pressed(&mut bs_latch) {
+                        chat_input.pop();
                     }
-                    chat_input.clear();
+                    let mut shown = chat_input.clone();
+                    shown.push('|');
+                    draw_text_ex(
+                        &shown,
+                        chat_rect.x + 10.0,
+                        chat_rect.y + 28.0,
+                        TextParams {
+                            font: font.as_ref(),
+                            font_size: 20,
+                            color: WHITE,
+                            ..Default::default()
+                        },
+                    );
+                } else {
+                    draw_text_ex(
+                        "Enter — чат | Esc — выход с сервера",
+                        chat_rect.x + 10.0,
+                        chat_rect.y + 28.0,
+                        TextParams {
+                            font: font.as_ref(),
+                            font_size: 18,
+                            color: Color::new(0.75, 0.78, 0.82, 1.0),
+                            ..Default::default()
+                        },
+                    );
                 }
-                let mut shown = chat_input.clone();
-                shown.push('|');
-                draw_text_ex(
-                    &shown,
-                    chat_rect.x + 10.0,
-                    chat_rect.y + 28.0,
-                    TextParams {
-                        font: font.as_ref(),
-                        font_size: 20,
-                        color: WHITE,
-                        ..Default::default()
-                    },
-                );
             }
 
             NetState::Error(ref msg) => {
@@ -1293,6 +1344,8 @@ async fn main() {
                     || is_key_pressed(KeyCode::Escape)
                 {
                     disconnect(&mut events, &mut chat_tx, &mut cancel, &mut world, &mut chat_log);
+                    chat_open = false;
+                    chat_input.clear();
                     net_state = NetState::Menu;
                 }
             }
