@@ -11,7 +11,7 @@ mod world;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use macroquad::prelude::*;
@@ -19,7 +19,7 @@ use macroquad::window::Conf;
 
 use atlas::{Atlas, Region};
 use entities::{PlayerState, UnitState};
-use net::{NetEvent, NetState};
+use net::{ClientInput, NetEvent, NetState};
 use world::World;
 
 fn window_conf() -> Conf {
@@ -467,11 +467,13 @@ fn begin_connect(
     host: String,
     port: u16,
     name: String,
+    input: Arc<Mutex<ClientInput>>,
 ) -> (Receiver<NetEvent>, Sender<String>, Arc<AtomicBool>) {
     let (tx_ev, rx_ev) = std::sync::mpsc::channel();
     let (tx_chat, rx_chat) = std::sync::mpsc::channel();
+    *input.lock().unwrap() = ClientInput::default();
     let cancel = Arc::new(AtomicBool::new(false));
-    net::start(host, port, name, tx_ev, rx_chat, Arc::clone(&cancel));
+    net::start(host, port, name, tx_ev, rx_chat, Arc::clone(&cancel), input);
     (rx_ev, tx_chat, cancel)
 }
 
@@ -482,12 +484,14 @@ fn connect_to(
     events: &mut Option<Receiver<NetEvent>>,
     chat_tx: &mut Option<Sender<String>>,
     cancel: &mut Option<Arc<AtomicBool>>,
+    input: &Arc<Mutex<ClientInput>>,
     status: &mut String,
     progress: &mut f32,
     net_state: &mut NetState,
 ) {
     let p: u16 = port.parse().unwrap_or(6567);
-    let (rx_ev, tx_chat, flag) = begin_connect(host.to_string(), p, name.to_string());
+    let (rx_ev, tx_chat, flag) =
+        begin_connect(host.to_string(), p, name.to_string(), Arc::clone(input));
     *events = Some(rx_ev);
     *chat_tx = Some(tx_chat);
     *cancel = Some(flag);
@@ -751,6 +755,10 @@ async fn main() {
     let mut events: Option<Receiver<NetEvent>> = None;
     let mut chat_tx: Option<Sender<String>> = None;
     let mut cancel: Option<Arc<AtomicBool>> = None;
+    let client_input = Arc::new(Mutex::new(ClientInput::default()));
+    let mut own_unit_id = -1i32;
+    let mut own_x = 0.0f32;
+    let mut own_y = 0.0f32;
     let mut status = String::new();
     let mut progress = 0.0f32;
     let mut world: Option<World> = None;
@@ -780,6 +788,7 @@ async fn main() {
             &mut events,
             &mut chat_tx,
             &mut cancel,
+            &client_input,
             &mut status,
             &mut progress,
             &mut net_state,
@@ -814,6 +823,9 @@ async fn main() {
                     NetEvent::World(w) => {
                         cam_x = w.width as f32 / 2.0;
                         cam_y = w.height as f32 / 2.0;
+                        own_unit_id = -1;
+                        own_x = w.width as f32 * 4.0;
+                        own_y = w.height as f32 * 4.0;
                         world = Some(w);
                         players.clear();
                         units.clear();
@@ -886,6 +898,26 @@ async fn main() {
                         }
                     }
                     NetEvent::Entities { players: update, units: new_units, skipped } => {
+                        let my_player_id = world.as_ref().map(|w| w.player_id);
+                        let my_unit = my_player_id
+                            .and_then(|id| update.iter().find(|p| p.id == id))
+                            .and_then(|p| new_units.iter().find(|u| u.id == p.unit_id));
+                        if let Some(u) = my_unit {
+                            own_unit_id = u.id;
+                            // Первый снимок задаёт позицию; дальше её ведём сами.
+                            if own_x == 0.0 && own_y == 0.0 {
+                                own_x = u.x;
+                                own_y = u.y;
+                            }
+                        } else if own_unit_id < 0 {
+                            if let Some(p) = my_player_id
+                                .and_then(|id| update.iter().find(|pid| pid.id == id))
+                            {
+                                own_unit_id = p.unit_id;
+                                own_x = p.x;
+                                own_y = p.y;
+                            }
+                        }
                         players = update;
                         units = new_units;
                         skipped_entities = skipped;
@@ -973,6 +1005,7 @@ async fn main() {
                         &mut events,
                         &mut chat_tx,
                         &mut cancel,
+                        &client_input,
                         &mut status,
                         &mut progress,
                         &mut net_state,
@@ -1006,6 +1039,7 @@ async fn main() {
                             &mut events,
                             &mut chat_tx,
                             &mut cancel,
+                            &client_input,
                             &mut status,
                             &mut progress,
                             &mut net_state,
@@ -1014,7 +1048,7 @@ async fn main() {
                 }
 
                 draw_text_ex(
-                    "Управление: клик по полю, ввод, Enter — подключиться. Кнопки снизу — быстрый вход.",
+                    "Управление: WASD/стрелки — движение, ЛКМ — стрельба, ПКМ — камера, Enter — чат.",
                     40.0,
                     screen_height() - 28.0,
                     TextParams {
@@ -1067,12 +1101,61 @@ async fn main() {
                     if wheel != 0.0 {
                         zoom = (zoom + wheel * 0.1).clamp(0.4, 3.0);
                     }
-                    if is_mouse_button_down(MouseButton::Left) && my > 40.0 && my < screen_height() - 70.0 {
+                    if is_mouse_button_down(MouseButton::Right)
+                        && my > 40.0
+                        && my < screen_height() - 70.0
+                    {
                         cam_x -= (mx - last_mouse.0) / (16.0 * zoom);
                         cam_y += (my - last_mouse.1) / (16.0 * zoom);
                     }
-                    draw_world(w, atlas.as_ref(), &pages, palette.as_ref(), cam_x, cam_y, zoom);
                     let tile = 16.0 * zoom;
+
+                    // Управление своим юнитом: WASD/стрелки задают направление,
+                    // ЛКМ стреляет, ПКМ двигает камеру, Shift ускоряет.
+                    let mut dir_x = 0.0f32;
+                    let mut dir_y = 0.0f32;
+                    if is_key_down(KeyCode::A) || is_key_down(KeyCode::Left) { dir_x -= 1.0; }
+                    if is_key_down(KeyCode::D) || is_key_down(KeyCode::Right) { dir_x += 1.0; }
+                    if is_key_down(KeyCode::W) || is_key_down(KeyCode::Up) { dir_y += 1.0; }
+                    if is_key_down(KeyCode::S) || is_key_down(KeyCode::Down) { dir_y -= 1.0; }
+                    let len = (dir_x * dir_x + dir_y * dir_y).sqrt();
+                    if len > 0.0 {
+                        dir_x /= len;
+                        dir_y /= len;
+                    }
+                    let speed = 18.0f32;
+                    let step = speed * get_frame_time();
+                    own_x += dir_x * step;
+                    own_y += dir_y * step;
+
+                    let mouse_world_x = (cam_x + (mx - screen_width() / 2.0) / tile) * 8.0;
+                    let mouse_world_y = (cam_y - (my - screen_height() / 2.0) / tile) * 8.0;
+                    let rotation = (mouse_world_y - own_y).atan2(mouse_world_x - own_x);
+                    let shooting = is_mouse_button_down(MouseButton::Left)
+                        && my > 40.0
+                        && my < screen_height() - 70.0
+                        && !chat_rect.contains(vec2(mx, my));
+                    let boosting = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
+
+                    {
+                        let mut input = client_input.lock().unwrap();
+                        input.unit_id = own_unit_id;
+                        input.x = own_x;
+                        input.y = own_y;
+                        input.pointer_x = mouse_world_x;
+                        input.pointer_y = mouse_world_y;
+                        input.rotation = rotation;
+                        input.vx = dir_x * speed;
+                        input.vy = dir_y * speed;
+                        input.shooting = shooting;
+                        input.boosting = boosting;
+                        input.view_x = cam_x * 8.0;
+                        input.view_y = cam_y * 8.0;
+                        input.view_w = screen_width() / (2.0 * zoom);
+                        input.view_h = screen_height() / (2.0 * zoom);
+                    }
+
+                    draw_world(w, atlas.as_ref(), &pages, palette.as_ref(), cam_x, cam_y, zoom);
                     for p in &players {
                         // Позиции сущностей заданы в пикселях мира: 1 тайл = 8 единиц.
                         let px = p.x / 8.0;
@@ -1084,8 +1167,8 @@ async fn main() {
                         }
                     }
                     for u in &units {
-                        let ux = u.x / 8.0;
-                        let uy = u.y / 8.0;
+                        let ux = if u.id == own_unit_id { own_x } else { u.x / 8.0 };
+                        let uy = if u.id == own_unit_id { own_y } else { u.y / 8.0 };
                         let sx = (ux - cam_x) * tile + screen_width() / 2.0;
                         let sy = (cam_y - uy) * tile + screen_height() / 2.0;
                         if sx > -40.0 && sy > -40.0 && sx < screen_width() + 40.0 && sy < screen_height() + 40.0 {
@@ -1114,7 +1197,10 @@ async fn main() {
                     format!(" | ENT не разобрано: {}", skipped_entities)
                 };
                 draw_text_ex(
-                    &format!("MindaRust | FPS {:.0} | статус: {}{}", fps, status, entity_note),
+                    &format!(
+                        "MindaRust | FPS {:.0} | юнит {} ({:.0},{:.0}) | {}{}",
+                        fps, own_unit_id, own_x, own_y, status, entity_note
+                    ),
                     12.0,
                     25.0,
                     TextParams {

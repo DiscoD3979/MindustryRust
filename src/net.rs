@@ -56,6 +56,47 @@ pub enum NetState {
     Error(String),
 }
 
+/// Состояние управления, которое окно обновляет каждый кадр, а сетевой поток
+/// отправляет серверу в ClientSnapshot. Координаты — в единицах мира (1 тайл = 8).
+#[derive(Clone, Debug)]
+pub struct ClientInput {
+    pub unit_id: i32,
+    pub x: f32,
+    pub y: f32,
+    pub pointer_x: f32,
+    pub pointer_y: f32,
+    pub rotation: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub shooting: bool,
+    pub boosting: bool,
+    pub view_x: f32,
+    pub view_y: f32,
+    pub view_w: f32,
+    pub view_h: f32,
+}
+
+impl Default for ClientInput {
+    fn default() -> Self {
+        Self {
+            unit_id: -1,
+            x: 0.0,
+            y: 0.0,
+            pointer_x: 0.0,
+            pointer_y: 0.0,
+            rotation: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            shooting: false,
+            boosting: false,
+            view_x: 0.0,
+            view_y: 0.0,
+            view_w: 64.0,
+            view_h: 64.0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum NetEvent {
     Status(String),
@@ -157,24 +198,32 @@ fn build_connect(name: &str, usid: &str, uuid_bytes: &[u8]) -> Vec<u8> {
     p
 }
 
-fn build_snapshot(snapshot_id: i32) -> Vec<u8> {
+/// ClientSnapshotCallPacket (id 29), точный порядок полей из NetClient.sync().
+fn build_snapshot(snapshot_id: i32, input: &ClientInput, view_x: f32, view_y: f32, view_w: f32, view_h: f32) -> Vec<u8> {
     let mut p = Vec::new();
     put_i32(&mut p, snapshot_id);
-    put_i32(&mut p, -1);
-    put_bool(&mut p, true);
-    for _ in 0..8 {
-        put_f32(&mut p, 0.0);
-    }
-    put_i32(&mut p, -1);
-    for _ in 0..4 {
-        put_bool(&mut p, false);
-    }
-    put_i16(&mut p, -1);
-    put_i32(&mut p, 0);
-    put_i32(&mut p, -1);
-    for _ in 0..4 {
-        put_f32(&mut p, 0.0);
-    }
+    put_i32(&mut p, input.unit_id);
+    put_bool(&mut p, input.unit_id < 0);
+    put_f32(&mut p, input.x);
+    put_f32(&mut p, input.y);
+    put_f32(&mut p, input.pointer_x);
+    put_f32(&mut p, input.pointer_y);
+    put_f32(&mut p, input.rotation);
+    put_f32(&mut p, 0.0); // baseRotation (только Mechc)
+    put_f32(&mut p, input.vx);
+    put_f32(&mut p, input.vy);
+    put_i32(&mut p, -1); // mining
+    put_bool(&mut p, input.boosting);
+    put_bool(&mut p, input.shooting);
+    put_bool(&mut p, false); // chatting
+    put_bool(&mut p, false); // building
+    put_i16(&mut p, -1); // selectedBlock
+    put_i32(&mut p, 0); // selectedRotation
+    put_i32(&mut p, -1); // plans
+    put_f32(&mut p, view_x);
+    put_f32(&mut p, view_y);
+    put_f32(&mut p, view_w);
+    put_f32(&mut p, view_h);
     p
 }
 
@@ -285,6 +334,7 @@ pub fn start(
     tx: Sender<NetEvent>,
     rx: Receiver<String>,
     cancel: Arc<AtomicBool>,
+    input: Arc<Mutex<ClientInput>>,
 ) {
     thread::spawn(move || {
         if cancelled(&cancel) {
@@ -692,7 +742,15 @@ pub fn start(
             }
 
             if last_snapshot.elapsed() >= Duration::from_millis(66) {
-                let payload = build_snapshot(snapshot_id);
+                let snap = input.lock().unwrap().clone();
+                let payload = build_snapshot(
+                    snapshot_id,
+                    &snap,
+                    snap.view_x,
+                    snap.view_y,
+                    snap.view_w,
+                    snap.view_h,
+                );
                 let _ = udp.send(&packet_body(ID_CLIENT_SNAPSHOT, &payload));
                 snapshot_id = snapshot_id.wrapping_add(1);
                 last_snapshot = Instant::now();
@@ -837,5 +895,38 @@ mod tests {
         data.push(3);
         assert_eq!(decode_set_team(&data), Some((77, 3)));
         assert_eq!(decode_set_team(&data[..3]), None);
+    }
+
+    #[test]
+    fn client_snapshot_carries_movement_and_aim() {
+        let input = ClientInput {
+            unit_id: 42,
+            x: 120.5,
+            y: -64.25,
+            pointer_x: 200.0,
+            pointer_y: 10.0,
+            rotation: 0.75,
+            vx: 1.5,
+            vy: -2.5,
+            shooting: true,
+            boosting: false,
+            view_x: 100.0,
+            view_y: 50.0,
+            view_w: 640.0,
+            view_h: 360.0,
+        };
+        let data = build_snapshot(7, &input, input.view_x, input.view_y, input.view_w, input.view_h);
+        let mut pos = 0;
+        assert_eq!(get_i32(&data, &mut pos), Some(7));
+        assert_eq!(get_i32(&data, &mut pos), Some(42));
+        assert_eq!(get_bool(&data, &mut pos), Some(false));
+        assert_eq!(get_f32(&data, &mut pos), Some(120.5));
+        assert_eq!(get_f32(&data, &mut pos), Some(-64.25));
+        assert_eq!(get_f32(&data, &mut pos), Some(200.0));
+        assert_eq!(get_f32(&data, &mut pos), Some(10.0));
+        assert_eq!(get_f32(&data, &mut pos), Some(0.75));
+        assert_eq!(get_f32(&data, &mut pos), Some(0.0));
+        assert_eq!(get_f32(&data, &mut pos), Some(1.5));
+        assert_eq!(get_f32(&data, &mut pos), Some(-2.5));
     }
 }

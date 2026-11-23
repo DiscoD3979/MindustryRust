@@ -9,6 +9,8 @@ use crate::wire::*;
 
 #[derive(Clone, Debug)]
 pub struct World {
+    /// id собственного игрока из потока мира (NetworkIO: stream.writeInt(player.id)).
+    pub player_id: i32,
     pub width: usize,
     pub height: usize,
     /// id пола для каждой клетки.
@@ -177,7 +179,7 @@ pub fn parse_world(compressed: &[u8]) -> Result<World, String> {
     need(get_i64(&data, &mut p).is_some(), "seed1")?;
 
     // player id + player.read
-    need(get_i32(&data, &mut p).is_some(), "player id")?;
+    let player_id = get_i32(&data, &mut p).ok_or("player id")?;
     skip_player(&data, &mut p)?;
 
     // writeContentHeader
@@ -273,6 +275,7 @@ pub fn parse_world(compressed: &[u8]) -> Result<World, String> {
     }
 
     Ok(World {
+        player_id,
         width,
         height,
         floors,
