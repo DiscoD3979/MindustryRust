@@ -9,7 +9,9 @@ mod wire;
 mod world;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::Instant;
 
 use macroquad::prelude::*;
@@ -408,7 +410,6 @@ fn draw_world(
             let floor_name = name_for(world, floor);
             let mut drawn = false;
             if let Some(a) = atlas {
-                let idx = y as usize * world.width + x as usize;
                 let variant = 1 + floor_variant(x, y, 6);
                 let name = format!("{}{}", floor_name, variant);
                 drawn = draw_sprite(a, pages, &name, sx, sy, tile, WHITE)
@@ -453,6 +454,254 @@ fn draw_world(
             }
         }
     }
+}
+
+/// Кнопки быстрого подключения к постоянным серверам.
+const QUICK_SERVERS: [(&str, &str); 3] = [
+    ("144.31.93.177", "6547"),
+    ("46.149.69.116", "5555"),
+    ("178.253.45.82", "6567"),
+];
+
+fn begin_connect(
+    host: String,
+    port: u16,
+    name: String,
+) -> (Receiver<NetEvent>, Sender<String>, Arc<AtomicBool>) {
+    let (tx_ev, rx_ev) = std::sync::mpsc::channel();
+    let (tx_chat, rx_chat) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    net::start(host, port, name, tx_ev, rx_chat, Arc::clone(&cancel));
+    (rx_ev, tx_chat, cancel)
+}
+
+fn connect_to(
+    host: &str,
+    port: &str,
+    name: &str,
+    events: &mut Option<Receiver<NetEvent>>,
+    chat_tx: &mut Option<Sender<String>>,
+    cancel: &mut Option<Arc<AtomicBool>>,
+    status: &mut String,
+    progress: &mut f32,
+    net_state: &mut NetState,
+) {
+    let p: u16 = port.parse().unwrap_or(6567);
+    let (rx_ev, tx_chat, flag) = begin_connect(host.to_string(), p, name.to_string());
+    *events = Some(rx_ev);
+    *chat_tx = Some(tx_chat);
+    *cancel = Some(flag);
+    *status = format!("Подключаюсь к {}:{} ...", host, p);
+    *progress = 0.0;
+    *net_state = NetState::Loading;
+}
+
+fn disconnect(
+    events: &mut Option<Receiver<NetEvent>>,
+    chat_tx: &mut Option<Sender<String>>,
+    cancel: &mut Option<Arc<AtomicBool>>,
+    world: &mut Option<World>,
+    chat_log: &mut Vec<String>,
+) {
+    if let Some(flag) = cancel.take() {
+        flag.store(true, Ordering::Relaxed);
+    }
+    *events = None;
+    *chat_tx = None;
+    *world = None;
+    chat_log.clear();
+}
+
+fn draw_button(rect: Rect, label: &str, font: Option<&Font>) -> bool {
+    let hover = rect.contains(vec2(mouse_position().0, mouse_position().1));
+    draw_rectangle(
+        rect.x,
+        rect.y,
+        rect.w,
+        rect.h,
+        if hover {
+            Color::new(0.22, 0.55, 0.85, 1.0)
+        } else {
+            Color::new(0.16, 0.42, 0.68, 1.0)
+        },
+    );
+    draw_text_ex(
+        label,
+        rect.x + 12.0,
+        rect.y + rect.h - 12.0,
+        TextParams {
+            font,
+            font_size: 18,
+            color: WHITE,
+            ..Default::default()
+        },
+    );
+    hover && is_mouse_button_pressed(MouseButton::Left)
+}
+
+struct ChatSegment {
+    text: String,
+    color: Color,
+}
+
+fn hex_color(s: &str) -> Option<Color> {
+    let n = s.len();
+    if !((1..=6).contains(&n) || n == 8) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for b in s.bytes() {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as u32,
+            b'a'..=b'f' => (b - b'a' + 10) as u32,
+            b'A'..=b'F' => (b - b'A' + 10) as u32,
+            _ => return None,
+        };
+        value = (value << 4) | digit;
+    }
+    if n <= 6 {
+        value <<= (8 - n) * 4;
+    }
+    let r = (value >> 24) & 0xff;
+    let g = (value >> 16) & 0xff;
+    let b = (value >> 8) & 0xff;
+    let a = if n == 8 { value & 0xff } else { 0xff };
+    Some(Color::new(
+        r as f32 / 255.0,
+        g as f32 / 255.0,
+        b as f32 / 255.0,
+        a as f32 / 255.0,
+    ))
+}
+
+fn color_name(name: &str) -> Option<Color> {
+    let key = name.to_lowercase().replace('_', "");
+    let hex = match key.as_str() {
+        // Mindustry
+        "accent" | "stat" => "ffd37f",
+        "unlaunched" => "8982ed",
+        "highlight" => "ffe0a6",
+        "negstat" => "e55454",
+        // Arc / общие
+        "clear" => "00000000",
+        "black" => "000000",
+        "white" => "ffffff",
+        "lightgray" | "lightgrey" => "d3d3d3",
+        "gray" | "grey" => "808080",
+        "darkgray" | "darkgrey" => "a9a9a9",
+        "blue" | "royal" => "4169e1",
+        "navy" => "000080",
+        "slate" => "708090",
+        "sky" => "87ceeb",
+        "cyan" => "00ffff",
+        "teal" => "008080",
+        "green" => "38d667",
+        "acid" => "b5ff2f",
+        "lime" => "00ff00",
+        "forest" => "228b22",
+        "olive" => "808000",
+        "yellow" => "ffff00",
+        "gold" => "ffd700",
+        "goldenrod" => "daa520",
+        "orange" => "ffa500",
+        "brown" => "a52a2a",
+        "tan" => "d2b48c",
+        "brick" => "9c4b3d",
+        "red" => "e55454",
+        "scarlet" => "ff2400",
+        "crimson" => "dc143c",
+        "coral" => "ff7f50",
+        "salmon" => "fa8072",
+        "pink" => "ffc0cb",
+        "magenta" => "ff00ff",
+        "purple" => "800080",
+        "violet" => "ee82ee",
+        "maroon" => "800000",
+        _ => return None,
+    };
+    hex_color(hex)
+}
+
+fn push_run(out: &mut Vec<ChatSegment>, run: &mut String, color: Color) {
+    if !run.is_empty() {
+        out.push(ChatSegment {
+            text: std::mem::take(run),
+            color,
+        });
+    }
+}
+
+/// Разбор разметки чата Mindustry: [red], [#RRGGBBAA], [] (возврат цвета), [[.
+fn parse_chat(text: &str) -> Vec<ChatSegment> {
+    let mut out = Vec::new();
+    let mut run = String::new();
+    let mut stack = vec![WHITE];
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'[' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                run.push('[');
+                i += 2;
+                continue;
+            }
+            if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b']') {
+                let close = i + 1 + rel;
+                let tag = &text[i + 1..close];
+                if tag.is_empty() {
+                    let current = *stack.last().unwrap();
+                    push_run(&mut out, &mut run, current);
+                    if stack.len() > 1 {
+                        stack.pop();
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                let new_color = tag
+                    .strip_prefix('#')
+                    .and_then(hex_color)
+                    .or_else(|| color_name(tag));
+                if let Some(color) = new_color {
+                    let current = *stack.last().unwrap();
+                    push_run(&mut out, &mut run, current);
+                    stack.push(color);
+                    i = close + 1;
+                    continue;
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        run.push(ch);
+        i += ch.len_utf8();
+    }
+    let current = *stack.last().unwrap();
+    push_run(&mut out, &mut run, current);
+    out
+}
+
+fn draw_chat_text(text: &str, x: f32, y: f32, font: Option<&Font>, size: u16) {
+    let mut cursor = x;
+    for seg in parse_chat(text) {
+        draw_text_ex(
+            &seg.text,
+            cursor,
+            y,
+            TextParams {
+                font,
+                font_size: size,
+                color: seg.color,
+                ..Default::default()
+            },
+        );
+        cursor += measure_text(&seg.text, font, size, 1.0).width;
+    }
+}
+
+fn chat_width(text: &str, font: Option<&Font>, size: u16) -> f32 {
+    parse_chat(text)
+        .iter()
+        .map(|seg| measure_text(&seg.text, font, size, 1.0).width)
+        .sum()
 }
 
 #[macroquad::main(window_conf)]
@@ -501,6 +750,7 @@ async fn main() {
     let mut net_state = NetState::Menu;
     let mut events: Option<Receiver<NetEvent>> = None;
     let mut chat_tx: Option<Sender<String>> = None;
+    let mut cancel: Option<Arc<AtomicBool>> = None;
     let mut status = String::new();
     let mut progress = 0.0f32;
     let mut world: Option<World> = None;
@@ -523,15 +773,17 @@ async fn main() {
     // Если переданы аргументы (host [port] [name]), подключаемся сразу.
     // Без аргументов открывается меню, где всё можно ввести вручную.
     if args.len() > 1 {
-        let p: u16 = port.text.parse().unwrap_or(6567);
-        let (tx_ev, rx_ev) = std::sync::mpsc::channel();
-        let (tx_chat, rx_chat) = std::sync::mpsc::channel();
-        net::start(host.text.clone(), p, name.text.clone(), tx_ev, rx_chat);
-        events = Some(rx_ev);
-        chat_tx = Some(tx_chat);
-        net_state = NetState::Loading;
-        status = format!("Подключаюсь к {}:{} ...", host.text, p);
-        progress = 0.0;
+        connect_to(
+            &host.text,
+            &port.text,
+            &name.text,
+            &mut events,
+            &mut chat_tx,
+            &mut cancel,
+            &mut status,
+            &mut progress,
+            &mut net_state,
+        );
     }
 
     loop {
@@ -589,6 +841,46 @@ async fn main() {
                                 if idx < w.floors.len() {
                                     w.floors[idx] = if floor == 0 { 33 } else { floor };
                                     w.ores[idx] = overlay;
+                                }
+                            }
+                        }
+                    }
+                    NetEvent::BuildDestroyed(pos) => {
+                        if let Some(w) = &mut world {
+                            let x = (pos >> 16) as i16;
+                            let y = pos as i16;
+                            if x >= 0 && y >= 0 {
+                                let idx = y as usize * w.width + x as usize;
+                                if idx < w.blocks.len() {
+                                    w.blocks[idx] = 0;
+                                    w.centers[idx] = true;
+                                    w.health[idx] = -1.0;
+                                }
+                            }
+                        }
+                    }
+                    NetEvent::BuildHealth(updates) => {
+                        if let Some(w) = &mut world {
+                            for (pos, hp) in updates {
+                                let x = (pos >> 16) as i16;
+                                let y = pos as i16;
+                                if x >= 0 && y >= 0 {
+                                    let idx = y as usize * w.width + x as usize;
+                                    if idx < w.health.len() {
+                                        w.health[idx] = hp;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    NetEvent::TeamBlock { pos, team } => {
+                        if let Some(w) = &mut world {
+                            let x = (pos >> 16) as i16;
+                            let y = pos as i16;
+                            if x >= 0 && y >= 0 {
+                                let idx = y as usize * w.width + x as usize;
+                                if idx < w.teams.len() {
+                                    w.teams[idx] = team;
                                 }
                             }
                         }
@@ -674,21 +966,57 @@ async fn main() {
                 let clicked_connect = connect_rect.contains(vec2(mx, my))
                     && is_mouse_button_pressed(MouseButton::Left);
                 if clicked_connect || is_key_pressed(KeyCode::Enter) {
-                    let p: u16 = port.text.parse().unwrap_or(6567);
-                    let (tx_ev, rx_ev) = std::sync::mpsc::channel();
-                    let (tx_chat, rx_chat) = std::sync::mpsc::channel();
-                    net::start(host.text.clone(), p, name.text.clone(), tx_ev, rx_chat);
-                    events = Some(rx_ev);
-                    chat_tx = Some(tx_chat);
-                    net_state = NetState::Loading;
-                    status = format!("Подключаюсь к {}:{} ...", host.text, p);
-                    progress = 0.0;
+                    connect_to(
+                        &host.text,
+                        &port.text,
+                        &name.text,
+                        &mut events,
+                        &mut chat_tx,
+                        &mut cancel,
+                        &mut status,
+                        &mut progress,
+                        &mut net_state,
+                    );
                 }
 
                 draw_text_ex(
-                    "Управление: клик по полю, ввод, Enter — подключиться",
+                    "Быстрые сервера",
                     40.0,
-                    screen_height() - 40.0,
+                    315.0,
+                    TextParams {
+                        font: font.as_ref(),
+                        font_size: 18,
+                        color: Color::new(0.65, 0.72, 0.80, 1.0),
+                        ..Default::default()
+                    },
+                );
+                for (i, (quick_host, quick_port)) in QUICK_SERVERS.iter().enumerate() {
+                    let rect = Rect::new(40.0 + i as f32 * 250.0, 335.0, 235.0, 42.0);
+                    if draw_button(
+                        rect,
+                        &format!("{}:{}", quick_host, quick_port),
+                        font.as_ref(),
+                    ) {
+                        host.text = (*quick_host).to_string();
+                        port.text = (*quick_port).to_string();
+                        connect_to(
+                            quick_host,
+                            quick_port,
+                            &name.text,
+                            &mut events,
+                            &mut chat_tx,
+                            &mut cancel,
+                            &mut status,
+                            &mut progress,
+                            &mut net_state,
+                        );
+                    }
+                }
+
+                draw_text_ex(
+                    "Управление: клик по полю, ввод, Enter — подключиться. Кнопки снизу — быстрый вход.",
+                    40.0,
+                    screen_height() - 28.0,
                     TextParams {
                         font: font.as_ref(),
                         font_size: 16,
@@ -724,6 +1052,13 @@ async fn main() {
                 draw_rectangle(40.0, 190.0, 600.0, 18.0, Color::new(0.15, 0.18, 0.22, 1.0));
                 draw_rectangle(40.0, 190.0, 600.0 * progress.clamp(0.0, 1.0), 18.0,
                     Color::new(0.25, 0.65, 1.0, 1.0));
+
+                if draw_button(Rect::new(40.0, 240.0, 170.0, 44.0), "Отмена", font.as_ref())
+                    || is_key_pressed(KeyCode::Escape)
+                {
+                    disconnect(&mut events, &mut chat_tx, &mut cancel, &mut world, &mut chat_log);
+                    net_state = NetState::Menu;
+                }
             }
 
             NetState::Playing => {
@@ -790,22 +1125,28 @@ async fn main() {
                     },
                 );
 
+                if draw_button(
+                    Rect::new(screen_width() - 160.0, 4.0, 148.0, 28.0),
+                    "Выйти с сервера",
+                    font.as_ref(),
+                ) || is_key_pressed(KeyCode::Escape)
+                {
+                    disconnect(&mut events, &mut chat_tx, &mut cancel, &mut world, &mut chat_log);
+                    net_state = NetState::Menu;
+                }
+
                 // Чат
                 let log_y = screen_height() - 70.0 - chat_log.len() as f32 * 24.0;
                 for (i, line) in chat_log.iter().enumerate() {
-                    draw_rectangle(12.0, log_y + i as f32 * 24.0, measure_text(line, font.as_ref(), 18, 1.0).width + 16.0,
-                        22.0, Color::new(0.0, 0.0, 0.0, 0.45));
-                    draw_text_ex(
-                        line,
-                        20.0,
-                        log_y + i as f32 * 24.0 + 17.0,
-                        TextParams {
-                            font: font.as_ref(),
-                            font_size: 18,
-                            color: WHITE,
-                            ..Default::default()
-                        },
+                    let y = log_y + i as f32 * 24.0;
+                    draw_rectangle(
+                        12.0,
+                        y,
+                        chat_width(line, font.as_ref(), 18) + 16.0,
+                        22.0,
+                        Color::new(0.0, 0.0, 0.0, 0.45),
                     );
+                    draw_chat_text(line, 20.0, y + 17.0, font.as_ref(), 18);
                 }
 
                 draw_rectangle(chat_rect.x, chat_rect.y, chat_rect.w, chat_rect.h,
@@ -862,22 +1203,11 @@ async fn main() {
                         ..Default::default()
                     },
                 );
-                draw_text_ex(
-                    "Нажми Esc, чтобы вернуться в меню",
-                    40.0,
-                    200.0,
-                    TextParams {
-                        font: font.as_ref(),
-                        font_size: 20,
-                        color: Color::new(0.70, 0.75, 0.82, 1.0),
-                        ..Default::default()
-                    },
-                );
-                if is_key_pressed(KeyCode::Escape) {
+                if draw_button(Rect::new(40.0, 210.0, 170.0, 44.0), "В меню", font.as_ref())
+                    || is_key_pressed(KeyCode::Escape)
+                {
+                    disconnect(&mut events, &mut chat_tx, &mut cancel, &mut world, &mut chat_log);
                     net_state = NetState::Menu;
-                    events = None;
-                    chat_tx = None;
-                    world = None;
                 }
             }
         }
@@ -889,7 +1219,27 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::floor_variant;
+    use super::{floor_variant, hex_color, parse_chat};
+
+    #[test]
+    fn chat_named_color_and_pop() {
+        let parts = parse_chat("[red]привет[] мир");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].text, "привет");
+        assert!((parts[0].color.r - (0xe5 as f32) / 255.0).abs() < 0.01);
+        assert_eq!(parts[1].text, " мир");
+        assert!(parts[1].color.a > 0.99);
+    }
+
+    #[test]
+    fn chat_hex_and_escaped_bracket() {
+        let parts = parse_chat("[#00ff00]a[[b]");
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].text, "a[b]");
+        assert!(parts[0].color.g > 0.99);
+        assert_eq!(hex_color("ff000080").unwrap().a, 128.0 / 255.0);
+        assert!(hex_color("1234567").is_none());
+    }
 
     #[test]
     fn floor_variant_matches_arc_rand() {

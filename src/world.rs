@@ -19,6 +19,10 @@ pub struct World {
     pub blocks: Vec<i16>,
     /// только для этих клеток нужно рисовать спрайт блока (центр многоклеточного).
     pub centers: Vec<bool>,
+    /// команда владельца здания для каждой клетки (обновляется пакетами SetTeam).
+    pub teams: Vec<u8>,
+    /// прочность здания для каждой клетки (-1, если неизвестна).
+    pub health: Vec<f32>,
     /// вариант текстуры пола (floorData) для каждой клетки.
     pub floor_data: Vec<u8>,
     /// имена блоков, полученные от сервера в content header (могут отличаться
@@ -226,6 +230,8 @@ pub fn parse_world(compressed: &[u8]) -> Result<World, String> {
     // идёт байт consecutives, и следующие тайлы имеют тот же блок.
     let mut blocks = vec![0i16; total];
     let mut centers = vec![true; total];
+    let teams = vec![1u8; total];
+    let health = vec![-1.0f32; total];
     i = 0;
     while i < total {
         let block = get_i16(&data, &mut p).ok_or("block id")?;
@@ -273,6 +279,8 @@ pub fn parse_world(compressed: &[u8]) -> Result<World, String> {
         ores,
         blocks,
         centers,
+        teams,
+        health,
         floor_data,
         block_names,
         unit_names,

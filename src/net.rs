@@ -3,6 +3,7 @@
 
 use std::io::{self, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -34,6 +35,9 @@ const ID_SET_FLOOR: u8 = 114; // SetFloorCallPacket
 const ID_ENTITY_SNAPSHOT: u8 = 49; // EntitySnapshotCallPacket (UDP)
 const ID_PLAYER_DISCONNECT: u8 = 88; // PlayerDisconnectCallPacket
 const ID_SET_TILE: u8 = 130; // SetTileCallPacket
+const ID_BUILD_DESTROYED: u8 = 15; // BuildDestroyedCallPacket
+const ID_BUILD_HEALTH: u8 = 16; // BuildHealthUpdateCallPacket
+const ID_SET_TEAM: u8 = 128; // SetTeamCallPacket
 
 const VERSION_BUILD: i32 = 160;
 const VERSION_TYPE: &str = "official";
@@ -68,6 +72,12 @@ pub enum NetEvent {
         pos: i32,
         floor: i16,
         overlay: i16,
+    },
+    BuildDestroyed(i32),
+    BuildHealth(Vec<(i32, f32)>),
+    TeamBlock {
+        pos: i32,
+        team: u8,
     },
     Entities {
         players: Vec<PlayerState>,
@@ -168,17 +178,59 @@ fn build_snapshot(snapshot_id: i32) -> Vec<u8> {
     p
 }
 
+/// BuildDestroyed: TypeIO.writeBuilding → i32 tile.pos.
+fn decode_build_destroyed(data: &[u8]) -> Option<i32> {
+    let mut p = 0;
+    get_i32(data, &mut p)
+}
+
+/// BuildHealthUpdate: TypeIO.writeIntSeq — i32 count, затем пары (pos, f32 health как i32 bits).
+fn decode_build_health(data: &[u8]) -> Option<Vec<(i32, f32)>> {
+    let mut p = 0;
+    let count = get_i32(data, &mut p)?;
+    if count < 0 || count % 2 != 0 {
+        return None;
+    }
+    let count = count as usize;
+    if count.checked_mul(4)? > data.len().saturating_sub(p) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count / 2);
+    for _ in (0..count).step_by(2) {
+        let pos = get_i32(data, &mut p)?;
+        let bits = get_i32(data, &mut p)?;
+        out.push((pos, f32::from_bits(bits as u32)));
+    }
+    Some(out)
+}
+
+/// SetTeam: TypeIO.writeBuilding + TypeIO.writeTeam → i32 pos, u8 team.
+fn decode_set_team(data: &[u8]) -> Option<(i32, u8)> {
+    let mut p = 0;
+    let pos = get_i32(data, &mut p)?;
+    let team = get_u8(data, &mut p)?;
+    Some((pos, team))
+}
+
 fn emit(tx: &Sender<NetEvent>, event: NetEvent) {
     let _ = tx.send(event);
+}
+
+fn cancelled(flag: &Arc<AtomicBool>) -> bool {
+    flag.load(Ordering::Relaxed)
 }
 
 fn wait_for_connection_id(
     state: &Arc<Mutex<State>>,
     tx: &Sender<NetEvent>,
     timeout: Duration,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<i32, ()> {
     let deadline = Instant::now() + timeout;
     loop {
+        if cancelled(cancel) {
+            return Err(());
+        }
         {
             let st = state.lock().unwrap();
             if let Some(id) = st.tcp_id {
@@ -226,8 +278,18 @@ fn finish_world(state: &Arc<Mutex<State>>, tx: &Sender<NetEvent>, compressed: &[
 }
 
 /// Запустить подключение в фоновом потоке.
-pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Receiver<String>) {
+pub fn start(
+    host: String,
+    port: u16,
+    name: String,
+    tx: Sender<NetEvent>,
+    rx: Receiver<String>,
+    cancel: Arc<AtomicBool>,
+) {
     thread::spawn(move || {
+        if cancelled(&cancel) {
+            return;
+        }
         let addr = match format!("{}:{}", host, port).to_socket_addrs() {
             Ok(mut it) => match it.next() {
                 Some(a) => a,
@@ -270,9 +332,13 @@ pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Re
             let state = Arc::clone(&state);
             let writer = Arc::clone(&writer);
             let tx = tx.clone();
+            let cancel = Arc::clone(&cancel);
             thread::spawn(move || {
                 let mut reader = stream;
                 loop {
+                    if cancelled(&cancel) {
+                        break;
+                    }
                     match read_tcp_frame(&mut reader) {
                         Ok(body) => {
                             let inb = match parse_body(&body) {
@@ -405,6 +471,21 @@ pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Re
                                             );
                                         }
                                     }
+                                    ID_BUILD_DESTROYED => {
+                                        if let Some(building) = decode_build_destroyed(&inb.data) {
+                                            emit(&tx, NetEvent::BuildDestroyed(building));
+                                        }
+                                    }
+                                    ID_BUILD_HEALTH => {
+                                        if let Some(updates) = decode_build_health(&inb.data) {
+                                            emit(&tx, NetEvent::BuildHealth(updates));
+                                        }
+                                    }
+                                    ID_SET_TEAM => {
+                                        if let Some((pos, team)) = decode_set_team(&inb.data) {
+                                            emit(&tx, NetEvent::TeamBlock { pos, team });
+                                        }
+                                    }
                                     ID_ENTITY_SNAPSHOT => {
                                         let mut pos = 0;
                                         let amount = get_i16(&inb.data, &mut pos);
@@ -454,7 +535,7 @@ pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Re
             });
         }
 
-        let conn_id = match wait_for_connection_id(&state, &tx, CONNECTION_ID_TIMEOUT) {
+        let conn_id = match wait_for_connection_id(&state, &tx, CONNECTION_ID_TIMEOUT, &cancel) {
             Ok(id) => id,
             Err(()) => return,
         };
@@ -477,6 +558,9 @@ pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Re
         let mut last_keepalive = Instant::now() - Duration::from_secs(10);
 
         loop {
+            if cancelled(&cancel) {
+                return;
+            }
             {
                 let st = state.lock().unwrap();
                 if st.udp_ok {
@@ -502,12 +586,17 @@ pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Re
         if let Ok(udp_reader) = udp.try_clone() {
             let tx_udp = tx.clone();
             let state_udp = Arc::clone(&state);
+            let cancel_udp = Arc::clone(&cancel);
+            udp_reader.set_read_timeout(Some(Duration::from_millis(100))).ok();
             thread::spawn(move || {
                 let mut buf = [0u8; 65535];
                 loop {
+                    if cancelled(&cancel_udp) {
+                        break;
+                    }
                     let n = match udp_reader.recv(&mut buf) {
                         Ok(n) => n,
-                        Err(_) => break,
+                        Err(_) => continue,
                     };
                     let inb = match parse_body(&buf[..n]) {
                         Some(inb) => inb,
@@ -559,6 +648,9 @@ pub fn start(host: String, port: u16, name: String, tx: Sender<NetEvent>, rx: Re
         let mut confirm_sent = false;
 
         loop {
+            if cancelled(&cancel) {
+                return;
+            }
             {
                 let st = state.lock().unwrap();
                 if let Some(reason) = &st.kick {
@@ -639,7 +731,12 @@ mod tests {
         });
 
         assert_eq!(
-            wait_for_connection_id(&state, &tx, Duration::from_secs(1)),
+            wait_for_connection_id(
+                &state,
+                &tx,
+                Duration::from_secs(1),
+                &Arc::new(AtomicBool::new(false)),
+            ),
             Ok(123)
         );
         handle.join().unwrap();
@@ -652,7 +749,12 @@ mod tests {
         let (tx, rx) = mpsc::channel();
 
         assert_eq!(
-            wait_for_connection_id(&state, &tx, Duration::from_millis(40)),
+            wait_for_connection_id(
+                &state,
+                &tx,
+                Duration::from_millis(40),
+                &Arc::new(AtomicBool::new(false)),
+            ),
             Err(())
         );
         match rx.try_recv().unwrap() {
@@ -672,11 +774,27 @@ mod tests {
         });
 
         assert_eq!(
-            wait_for_connection_id(&state, &tx, Duration::from_secs(1)),
+            wait_for_connection_id(
+                &state,
+                &tx,
+                Duration::from_secs(1),
+                &Arc::new(AtomicBool::new(false)),
+            ),
             Err(())
         );
         handle.join().unwrap();
         assert!(matches!(rx.try_recv().unwrap(), NetEvent::Kick(reason) if reason == "banned"));
+    }
+
+    #[test]
+    fn cancel_stops_connection_id_wait() {
+        let state = test_state();
+        let (tx, _rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            wait_for_connection_id(&state, &tx, Duration::from_secs(5), &cancel),
+            Err(())
+        );
     }
 
     #[test]
@@ -685,5 +803,39 @@ mod tests {
         let addr = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 6567);
         let err = connect_udp(&udp, addr).unwrap_err();
         assert!(err.contains("UDP"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn decodes_build_destroyed() {
+        let mut data = Vec::new();
+        put_i32(&mut data, 1234);
+        assert_eq!(decode_build_destroyed(&data), Some(1234));
+        assert_eq!(decode_build_destroyed(&data[..2]), None);
+    }
+
+    #[test]
+    fn decodes_build_health() {
+        let mut data = Vec::new();
+        put_i32(&mut data, 4);
+        put_i32(&mut data, 100);
+        put_i32(&mut data, 250.5f32.to_bits() as i32);
+        put_i32(&mut data, 200);
+        put_i32(&mut data, 99.0f32.to_bits() as i32);
+        let updates = decode_build_health(&data).unwrap();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].0, 100);
+        assert_eq!(updates[0].1, 250.5);
+        assert_eq!(updates[1].0, 200);
+        assert_eq!(updates[1].1, 99.0);
+        assert_eq!(decode_build_health(&[]), None);
+    }
+
+    #[test]
+    fn decodes_set_team() {
+        let mut data = Vec::new();
+        put_i32(&mut data, 77);
+        data.push(3);
+        assert_eq!(decode_set_team(&data), Some((77, 3)));
+        assert_eq!(decode_set_team(&data[..3]), None);
     }
 }
