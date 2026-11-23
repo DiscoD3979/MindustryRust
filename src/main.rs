@@ -3,6 +3,7 @@
 
 mod atlas;
 mod blocks;
+mod entities;
 mod net;
 mod wire;
 mod world;
@@ -15,6 +16,7 @@ use macroquad::prelude::*;
 use macroquad::window::Conf;
 
 use atlas::{Atlas, Region};
+use entities::{PlayerState, UnitState};
 use net::{NetEvent, NetState};
 use world::World;
 
@@ -234,6 +236,84 @@ fn draw_block_sprite(
     draw_sprite(atlas, pages, name, sx - off, sy - off, tile, WHITE)
 }
 
+/// Игроки пока рисуются цветной точкой с именем; спрайт зависит от юнита,
+/// поэтому юнит рисуется отдельной сущностью UnitState.
+fn draw_player(p: &PlayerState, sx: f32, sy: f32, tile: f32, font: Option<&Font>) {
+    let c = p.color as u32;
+    let color = if c == 0 || c == 0xFFFFFFFF {
+        Color::new(0.35, 0.85, 1.0, 1.0)
+    } else {
+        Color::new(
+            ((c >> 16) & 0xFF) as f32 / 255.0,
+            ((c >> 8) & 0xFF) as f32 / 255.0,
+            (c & 0xFF) as f32 / 255.0,
+            1.0,
+        )
+    };
+    let r = (tile * 0.55).clamp(2.0, 14.0);
+    draw_circle(sx, sy, r + 1.0, Color::new(0.0, 0.0, 0.0, 0.7));
+    draw_circle(sx, sy, r, color);
+    draw_text_ex(
+        &p.name,
+        sx + r + 4.0,
+        sy - r,
+        TextParams {
+            font,
+            font_size: 14,
+            color: WHITE,
+            ..Default::default()
+        },
+    );
+}
+
+/// Рисует юнит спрайтом из content header. Если спрайта нет — цветной точкой,
+/// чтобы сущность не пропадала на модифицированном сервере.
+fn draw_unit(
+    u: &UnitState,
+    name: Option<&str>,
+    atlas: Option<&Atlas>,
+    pages: &[Texture2D],
+    pos: Vec2,
+    tile: f32,
+    font: Option<&Font>,
+) {
+    let size = tile * 1.25;
+    let drawn = atlas
+        .zip(name)
+        .map(|(a, n)| {
+            draw_sprite(
+                a,
+                pages,
+                n,
+                pos.x - size / 2.0,
+                pos.y - size / 2.0,
+                size,
+                WHITE,
+            )
+        })
+        .unwrap_or(false);
+    if !drawn {
+        let team_color = match u.team {
+            0 => Color::new(0.35, 0.85, 1.0, 1.0),
+            1 => Color::new(0.95, 0.35, 0.35, 1.0),
+            _ => Color::new(0.85, 0.85, 0.45, 1.0),
+        };
+        let r = (tile * 0.45).clamp(2.0, 12.0);
+        draw_circle(pos.x, pos.y, r, team_color);
+    }
+    draw_text_ex(
+        format!("{}", u.unit_type),
+        pos.x + size / 2.0 + 3.0,
+        pos.y,
+        TextParams {
+            font,
+            font_size: 12,
+            color: Color::new(0.85, 0.90, 0.95, 0.8),
+            ..Default::default()
+        },
+    );
+}
+
 fn draw_world(
     world: &World,
     atlas: Option<&Atlas>,
@@ -368,6 +448,9 @@ async fn main() {
     let mut status = String::new();
     let mut progress = 0.0f32;
     let mut world: Option<World> = None;
+    let mut players: Vec<PlayerState> = Vec::new();
+    let mut units: Vec<UnitState> = Vec::new();
+    let mut skipped_entities = 0usize;
     let mut last_status = String::new();
     let mut chat_log: Vec<String> = Vec::new();
     let mut chat_input = String::new();
@@ -424,6 +507,43 @@ async fn main() {
                         cam_x = w.width as f32 / 2.0;
                         cam_y = w.height as f32 / 2.0;
                         world = Some(w);
+                        players.clear();
+                        units.clear();
+                        skipped_entities = 0;
+                    }
+                    NetEvent::TileBlock { pos, block, team: _, rotation: _ } => {
+                        if let Some(w) = &mut world {
+                            let x = (pos >> 16) as i16;
+                            let y = pos as i16;
+                            if x >= 0 && y >= 0 {
+                                let idx = y as usize * w.width + x as usize;
+                                if idx < w.blocks.len() {
+                                    w.blocks[idx] = block;
+                                    w.centers[idx] = true;
+                                }
+                            }
+                        }
+                    }
+                    NetEvent::TileFloor { pos, floor, overlay } => {
+                        if let Some(w) = &mut world {
+                            let x = (pos >> 16) as i16;
+                            let y = pos as i16;
+                            if x >= 0 && y >= 0 {
+                                let idx = y as usize * w.width + x as usize;
+                                if idx < w.floors.len() {
+                                    w.floors[idx] = if floor == 0 { 33 } else { floor };
+                                    w.ores[idx] = overlay;
+                                }
+                            }
+                        }
+                    }
+                    NetEvent::Entities { players: update, units: new_units, skipped } => {
+                        players = update;
+                        units = new_units;
+                        skipped_entities = skipped;
+                    }
+                    NetEvent::PlayerDisconnect(id) => {
+                        players.retain(|p| p.id != id);
                     }
                     NetEvent::Chat(text) => {
                         chat_log.push(text);
@@ -561,12 +681,44 @@ async fn main() {
                         cam_y += (my - last_mouse.1) / (16.0 * zoom);
                     }
                     draw_world(w, atlas.as_ref(), &pages, palette.as_ref(), cam_x, cam_y, zoom);
+                    let tile = 16.0 * zoom;
+                    for p in &players {
+                        let sx = (p.x - cam_x) * tile + screen_width() / 2.0;
+                        let sy = (cam_y - p.y) * tile + screen_height() / 2.0;
+                        if sx > -40.0 && sy > -40.0 && sx < screen_width() + 40.0 && sy < screen_height() + 40.0 {
+                            draw_player(p, sx, sy, tile, font.as_ref());
+                        }
+                    }
+                    for u in &units {
+                        let sx = (u.x - cam_x) * tile + screen_width() / 2.0;
+                        let sy = (cam_y - u.y) * tile + screen_height() / 2.0;
+                        if sx > -40.0 && sy > -40.0 && sx < screen_width() + 40.0 && sy < screen_height() + 40.0 {
+                            let name = usize::try_from(u.unit_type)
+                                .ok()
+                                .and_then(|i| w.unit_names.get(i))
+                                .map(String::as_str);
+                            draw_unit(
+                                u,
+                                name,
+                                atlas.as_ref(),
+                                &pages,
+                                vec2(sx, sy),
+                                tile,
+                                font.as_ref(),
+                            );
+                        }
+                    }
                 }
 
                 // HUD
                 draw_rectangle(0.0, 0.0, screen_width(), 36.0, Color::new(0.0, 0.0, 0.0, 0.55));
+                let entity_note = if skipped_entities == 0 {
+                    String::new()
+                } else {
+                    format!(" | ENT не разобрано: {}", skipped_entities)
+                };
                 draw_text_ex(
-                    &format!("MindaRust | FPS {:.0} | статус: {}", fps, status),
+                    &format!("MindaRust | FPS {:.0} | статус: {}{}", fps, status, entity_note),
                     12.0,
                     25.0,
                     TextParams {

@@ -24,6 +24,10 @@ pub struct World {
     /// имена блоков, полученные от сервера в content header (могут отличаться
     /// от ванильных на модифицированном сервере).
     pub block_names: Vec<String>,
+    /// имена юнитов из content header (ordinal 6).
+    pub unit_names: Vec<String>,
+    /// имена статусов из content header (ordinal 5).
+    pub status_names: Vec<String>,
 }
 
 impl World {
@@ -105,18 +109,19 @@ fn skip_player(data: &[u8], pos: &mut usize) -> Result<(), String> {
 }
 
 /// Прочитать content header: список имён контента с переопределёнными ID.
-/// Возвращает все списки; самый длинный — обычно блоки.
-fn read_content_header(data: &[u8], pos: &mut usize) -> Result<Vec<Vec<String>>, String> {
+/// Возвращает пары (тип контента, имена), чтобы не угадывать списки по длине.
+/// ContentType: 1 = block, 6 = unit.
+fn read_content_header(data: &[u8], pos: &mut usize) -> Result<Vec<(u8, Vec<String>)>, String> {
     let mapped = get_u8(data, pos).ok_or("нет content header")?;
     let mut all = Vec::new();
     for _ in 0..mapped {
-        let _typ = get_u8(data, pos).ok_or("тип контента")?;
+        let typ = get_u8(data, pos).ok_or("тип контента")?;
         let total = get_i16(data, pos).ok_or("размер content header")?;
         let mut names = Vec::new();
         for _ in 0..total.max(0) {
             names.push(get_utf_string(data, pos).ok_or("имя контента")?);
         }
-        all.push(names);
+        all.push((typ, names));
     }
     Ok(all)
 }
@@ -174,8 +179,19 @@ pub fn parse_world(compressed: &[u8]) -> Result<World, String> {
     // writeContentHeader
     let content = read_content_header(&data, &mut p)?;
     let block_names = content
-        .into_iter()
-        .max_by_key(|names| names.len())
+        .iter()
+        .find(|(typ, _)| *typ == 1)
+        .map(|(_, names)| names.clone())
+        .unwrap_or_default();
+    let unit_names = content
+        .iter()
+        .find(|(typ, _)| *typ == 6)
+        .map(|(_, names)| names.clone())
+        .unwrap_or_default();
+    let status_names = content
+        .iter()
+        .find(|(typ, _)| *typ == 5)
+        .map(|(_, names)| names.clone())
         .unwrap_or_default();
 
     // writeMap
@@ -250,5 +266,16 @@ pub fn parse_world(compressed: &[u8]) -> Result<World, String> {
         i += 1;
     }
 
-    Ok(World { width, height, floors, ores, blocks, centers, floor_data, block_names })
+    Ok(World {
+        width,
+        height,
+        floors,
+        ores,
+        blocks,
+        centers,
+        floor_data,
+        block_names,
+        unit_names,
+        status_names,
+    })
 }

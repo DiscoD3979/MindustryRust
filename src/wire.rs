@@ -405,10 +405,16 @@ pub fn parse_body(body: &[u8]) -> Option<Inbound> {
     }
     let compression = body[pos];
     pos += 1;
-    if pos + len > body.len() {
-        return None;
-    }
-    let raw = &body[pos..pos + len];
+    // Arc пишет в кадре нераспакованную длину, а затем сжатые байты.
+    // При сжатии длина сжатых байтов отличается от `len` — берём остаток кадра.
+    let raw = if compression == 1 {
+        &body[pos..]
+    } else {
+        if pos + len > body.len() {
+            return None;
+        }
+        &body[pos..pos + len]
+    };
     let data = if compression == 1 {
         lz4_decompress(raw)?
     } else {
@@ -458,4 +464,30 @@ mod tests {
         assert_eq!(inb.framework, Some(4));
         assert_eq!(inb.extra, vec![1, 2, 3, 4]);
     }
+
+    fn lz4_literals_only(data: &[u8]) -> Vec<u8> {
+        assert!(data.len() < 15);
+        let mut out = vec![(data.len() as u8) << 4];
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn compressed_packet_uses_frame_remainder() {
+        // arc сохраняет нераспакованную длину (u16), затем сжатые байты.
+        let payload = b"hi";
+        let compressed = lz4_literals_only(payload);
+        let mut body = vec![106];
+        put_u16(&mut body, payload.len() as u16);
+        body.push(1);
+        body.extend_from_slice(&compressed);
+        let mut frame = Vec::new();
+        put_u16(&mut frame, body.len() as u16);
+        frame.extend_from_slice(&body);
+
+        let inb = parse_body(&frame[2..]).unwrap();
+        assert_eq!(inb.id, 106);
+        assert_eq!(inb.data, b"hi");
+    }
+
 }
